@@ -7,32 +7,39 @@
 [![Actions status](https://github.com/astral-sh/ruff-lsp/workflows/CI/badge.svg)](https://github.com/astral-sh/ruff-lsp/actions)
 
 A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for
-[Ruff](https://github.com/astral-sh/ruff), an extremely fast Python linter and code transformation
-tool, written in Rust.
+[Ruff](https://github.com/astral-sh/ruff), an extremely fast Python linter and code formatter,
+written in Rust.
 
-Enables Ruff to be used in any editor that supports the LSP, including [Neovim](#example-neovim),
-[Sublime Text](#example-sublime-text), Emacs and more.
+Ruff can be used to replace Flake8 (plus dozens of plugins), Black, isort, pyupgrade, and more,
+all while executing tens or hundreds of times faster than any individual tool.
 
-For Visual Studio Code, check out the [Ruff VS Code extension](https://github.com/astral-sh/ruff-vscode).
+`ruff-lsp` enables Ruff to be used in any editor that supports the LSP, including [Neovim](#example-neovim),
+[Sublime Text](#example-sublime-text), Emacs and more. For Visual Studio Code, check out the
+[Ruff VS Code extension](https://github.com/astral-sh/ruff-vscode).
 
-ruff-lsp supports surfacing Ruff diagnostics and providing Code Actions to fix them, but is intended to be used
-alongside another Python LSP in order to support features like navigation and autocompletion.
+`ruff-lsp` supports surfacing Ruff diagnostics and providing Code Actions to fix them, but is
+intended to be used alongside another Python LSP in order to support features like navigation and
+autocompletion.
 
 ## Highlights
 
 ### "Quick Fix" actions for auto-fixable violations (like unused imports)
 
-![](https://user-images.githubusercontent.com/1309177/205176932-44cfc03a-120f-4bad-b710-612bdd7765d6.gif)
+![Using the "Quick Fix" action to fix a violation](https://user-images.githubusercontent.com/1309177/205176932-44cfc03a-120f-4bad-b710-612bdd7765d6.gif)
 
 ### "Fix all": automatically fix all auto-fixable violations
 
-![](https://user-images.githubusercontent.com/1309177/205175763-cf34871d-5c05-4abf-9916-440afc82dbf8.gif)
+![Using the "Fix all" action to fix all violations](https://user-images.githubusercontent.com/1309177/205175763-cf34871d-5c05-4abf-9916-440afc82dbf8.gif)
+
+### "Format Document": Black-compatible code formatting
+
+![Using the "Format Document" action to format Python source code](https://github.com/astral-sh/ruff-lsp/assets/1309177/51c27215-87fb-490c-b1d6-ee81ab4171a1)
 
 ### "Organize Imports": `isort`-compatible import sorting
 
-![](https://user-images.githubusercontent.com/1309177/205175987-82e23e21-14bb-467d-9ef0-027f24b75865.gif)
+![Using the "Organize Imports" action to sort and deduplicate Python imports](https://user-images.githubusercontent.com/1309177/205175987-82e23e21-14bb-467d-9ef0-027f24b75865.gif)
 
-## Installation and Usage
+## Installation
 
 `ruff-lsp` is available as [`ruff-lsp`](https://pypi.org/project/ruff-lsp/) on PyPI:
 
@@ -166,6 +173,24 @@ Upon successful installation, you should see errors surfaced directly in your ed
 
 ![](https://user-images.githubusercontent.com/1309177/209262106-71e34f8d-73cc-4889-89f7-3f54a4481c52.png)
 
+Future versions of Helix support the use of multiple language servers. The following configuration
+would enable the use of `ruff-lsp` alongside a language server like `pyright`:
+
+```toml
+[[language]]
+name = "python"
+roots = ["pyproject.toml"]
+language-servers = ["pyright", "ruff"]
+
+[language-server.pyright]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[language-server.ruff]
+command = "ruff-lsp"
+config = { settings = { run = "onSave" } }
+```
+
 ### Example: Lapce
 
 To use `ruff-lsp` with [Lapce](https://lapce.dev/), install the [`lapce-ruff-lsp`](https://plugins.lapce.dev/plugins/abreumatheus/lapce-ruff-lsp)
@@ -192,22 +217,33 @@ the LSP client's `settings.json`:
 }
 ```
 
+## Fix safety
+
+Ruff's automatic fixes are labeled as "safe" and "unsafe". By default, the "Fix all" action will not apply unsafe
+fixes. However, unsafe fixes can be applied manually with the "Quick fix" action. Application of unsafe fixes when
+using "Fix all" can be enabled by setting `unsafe-fixes = true` in your Ruff configuration file or adding 
+`--unsafe-fixes` flag to the "Lint args" setting.
+
+See the [Ruff fix docs](https://docs.astral.sh/ruff/configuration/#fix-safety) for more details on how fix
+safety works.
+
 ## Settings
 
 The exact mechanism by which settings will be passed to `ruff-lsp` will vary by editor. However,
 the following settings are supported:
 
-| Settings                             | Default  | Description                                                                                                                                                                                                                                                 |
-| ------------------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| args                                 | `[]`     | Additional command-line arguments to pass to `ruff`, e.g., `"args": ["--config=/path/to/pyproject.toml"]`. Supports a subset of Ruff's command-line arguments, ignoring those that are required to operate the LSP, like `--force-exclude` and `--verbose`. |
-| logLevel                             | `error`  | Sets the tracing level for the extension: `error`, `warn`, `info`, or `debug`.                                                                                                                                                                              |
-| path                                 | `[]`     | Path to a custom `ruff` executable, e.g., `["/path/to/ruff"]`.                                                                                                                                                                                              |
-| interpreter                          | `[]`     | Path to a Python interpreter to use to run the linter server.                                                                                                                                                                                               |
-| run                                  | `onType` | Run Ruff on every keystroke (`onType`) or on save (`onSave`).                                                                                                                                                                                               |
-| organizeImports                      | `true`   | Whether to register Ruff as capable of handling `source.organizeImports` actions.                                                                                                                                                                           |
-| fixAll                               | `true`   | Whether to register Ruff as capable of handling `source.fixAll` actions.                                                                                                                                                                                    |
-| codeAction.fixViolation.enable       | `true`   | Whether to display Quick Fix actions to autofix violations.                                                                                                                                                                                                 |
-| codeAction.disableRuleComment.enable | `true`   | Whether to display Quick Fix actions to disable rules via `noqa` suppression comments.                                                                                                                                                                      |
+| Settings                             | Default  | Description                                                                                                                                                                                                                                                        |
+|--------------------------------------| -------- |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| lint.args                            | `[]`     | Additional command-line arguments to pass to `ruff check`, e.g., `"args": ["--config=/path/to/pyproject.toml"]`. Supports a subset of Ruff's command-line arguments, ignoring those that are required to operate the LSP, like `--force-exclude` and `--verbose`.  |
+| lint.run                             | `onType` | Run Ruff on every keystroke (`onType`) or on save (`onSave`).                                                                                                                                                                                                      |
+| format.args                          | `[]`     | Additional command-line arguments to pass to `ruff format`, e.g., `"args": ["--config=/path/to/pyproject.toml"]`. Supports a subset of Ruff's command-line arguments, ignoring those that are required to operate the LSP, like `--force-exclude` and `--verbose`. |
+| path                                 | `[]`     | Path to a custom `ruff` executable, e.g., `["/path/to/ruff"]`.                                                                                                                                                                                                     |
+| interpreter                          | `[]`     | Path to a Python interpreter to use to run the linter server.                                                                                                                                                                                                      |
+| organizeImports                      | `true`   | Whether to register Ruff as capable of handling `source.organizeImports` actions.                                                                                                                                                                                  |
+| fixAll                               | `true`   | Whether to register Ruff as capable of handling `source.fixAll` actions.                                                                                                                                                                                           |
+| codeAction.fixViolation.enable       | `true`   | Whether to display Quick Fix actions to autofix violations.                                                                                                                                                                                                        |
+| logLevel                             | `error`  | Sets the tracing level for the extension: `error`, `warn`, `info`, or `debug`.                                                                                                                                                                                     |
+| codeAction.disableRuleComment.enable | `true`   | Whether to display Quick Fix actions to disable rules via `noqa` suppression comments.                                                                                                                                                                             |
 
 ## Development
 

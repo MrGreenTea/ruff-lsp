@@ -11,7 +11,7 @@ import shutil
 import sys
 import sysconfig
 from pathlib import Path
-from typing import Sequence, cast
+from typing import NamedTuple, Sequence, cast
 
 from lsprotocol import validators
 from lsprotocol.types import (
@@ -52,24 +52,27 @@ from lsprotocol.types import (
     TextEdit,
     WorkspaceEdit,
 )
+from packaging.specifiers import SpecifierSet, Version
 from pygls import server, uris, workspace
 from typing_extensions import TypedDict
 
 from ruff_lsp import __version__, utils
-from ruff_lsp.settings import UserSettings, WorkspaceSettings
+from ruff_lsp.settings import (
+    UserSettings,
+    WorkspaceSettings,
+    lint_args,
+    lint_run,
+)
 from ruff_lsp.utils import RunResult
 
 logger = logging.getLogger(__name__)
 
 RUFF_LSP_DEBUG = bool(os.environ.get("RUFF_LSP_DEBUG", False))
-RUFF_EXPERIMENTAL_FORMATTER = bool(os.environ.get("RUFF_EXPERIMENTAL_FORMATTER", False))
 
 if RUFF_LSP_DEBUG:
     log_file = Path(__file__).parent.parent.joinpath("ruff-lsp.log")
     logging.basicConfig(filename=log_file, filemode="w", level=logging.DEBUG)
     logger.info("RUFF_LSP_DEBUG is active")
-    if RUFF_EXPERIMENTAL_FORMATTER:
-        logger.info("RUFF_EXPERIMENTAL_FORMATTER is active")
 
 
 if sys.platform == "win32" and sys.version_info < (3, 8):
@@ -81,7 +84,15 @@ if sys.platform == "win32" and sys.version_info < (3, 8):
 GLOBAL_SETTINGS: UserSettings = {}
 WORKSPACE_SETTINGS: dict[str, WorkspaceSettings] = {}
 INTERPRETER_PATHS: dict[str, str] = {}
-EXECUTABLE_VERSIONS: dict[str, str] = {}
+
+
+class VersionModified(NamedTuple):
+    version: Version
+    """Last modified of the executable"""
+    modified: float
+
+
+EXECUTABLE_VERSIONS: dict[str, VersionModified] = {}
 CLIENT_CAPABILITIES: dict[str, bool] = {
     CODE_ACTION_RESOLVE: True,
 }
@@ -96,19 +107,27 @@ LSP_SERVER = server.LanguageServer(
 TOOL_MODULE = "ruff.exe" if sys.platform == "win32" else "ruff"
 TOOL_DISPLAY = "Ruff"
 
+# Require at least Ruff v0.0.291 for formatting, but allow older versions for linting.
+VERSION_REQUIREMENT_FORMATTER = SpecifierSet(">=0.0.291,<0.2.0")
+VERSION_REQUIREMENT_LINTER = SpecifierSet(">=0.0.189,<0.2.0")
+# Version requirement for use of the "ALL" rule selector
+VERSION_REQUIREMENT_ALL_SELECTOR = SpecifierSet(">=0.0.198,<0.2.0")
+# Version requirement for use of the `--output-format` option
+VERSION_REQUIREMENT_OUTPUT_FORMAT = SpecifierSet(">=0.0.291,<0.2.0")
+
 # Arguments provided to every Ruff invocation.
 CHECK_ARGS = [
     "--force-exclude",
     "--no-cache",
     "--no-fix",
     "--quiet",
-    "--format",
+    "--output-format",
     "json",
     "-",
 ]
 
-# Arguments that are not allowed to be passed to Ruff.
-UNSUPPORTED_ARGS = [
+# Arguments that are not allowed to be passed to `ruff check`.
+UNSUPPORTED_CHECK_ARGS = [
     # Arguments that enforce required behavior. These can be ignored with a warning.
     "--force-exclude",
     "--no-cache",
@@ -136,7 +155,23 @@ UNSUPPORTED_ARGS = [
     "--watch",
     # Arguments that are not supported at all, and will error when provided.
     # "--stdin-filename",
-    # "--format",
+    # "--output-format",
+]
+
+# Arguments that are not allowed to be passed to `ruff format`.
+UNSUPPORTED_FORMAT_ARGS = [
+    # Arguments that enforce required behavior. These can be ignored with a warning.
+    "--force-exclude",
+    "--quiet",
+    # Arguments that contradict the required behavior. These can be ignored with a
+    # warning.
+    "-h",
+    "--help",
+    "--no-force-exclude",
+    "--silent",
+    "--verbose",
+    # Arguments that are not supported at all, and will error when provided.
+    # "--stdin-filename",
 ]
 
 
@@ -148,7 +183,7 @@ UNSUPPORTED_ARGS = [
 @LSP_SERVER.feature(TEXT_DOCUMENT_DID_OPEN)
 async def did_open(params: DidOpenTextDocumentParams) -> None:
     """LSP handler for textDocument/didOpen request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
     diagnostics: list[Diagnostic] = await _lint_document_impl(document)
     LSP_SERVER.publish_diagnostics(document.uri, diagnostics)
 
@@ -156,7 +191,7 @@ async def did_open(params: DidOpenTextDocumentParams) -> None:
 @LSP_SERVER.feature(TEXT_DOCUMENT_DID_CLOSE)
 def did_close(params: DidCloseTextDocumentParams) -> None:
     """LSP handler for textDocument/didClose request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
     # Publishing empty diagnostics to clear the entries for this file.
     LSP_SERVER.publish_diagnostics(document.uri, [])
 
@@ -164,8 +199,8 @@ def did_close(params: DidCloseTextDocumentParams) -> None:
 @LSP_SERVER.feature(TEXT_DOCUMENT_DID_SAVE)
 async def did_save(params: DidSaveTextDocumentParams) -> None:
     """LSP handler for textDocument/didSave request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
-    if _get_settings_by_document(document).get("run", "onSave") == "onSave":
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
+    if lint_run(_get_settings_by_document(document.path)) in ("onType", "onSave"):
         diagnostics: list[Diagnostic] = await _lint_document_impl(document)
         LSP_SERVER.publish_diagnostics(document.uri, diagnostics)
 
@@ -173,13 +208,13 @@ async def did_save(params: DidSaveTextDocumentParams) -> None:
 @LSP_SERVER.feature(TEXT_DOCUMENT_DID_CHANGE)
 async def did_change(params: DidChangeTextDocumentParams) -> None:
     """LSP handler for textDocument/didChange request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
-    if _get_settings_by_document(document).get("run", "onType") == "onType":
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
+    if lint_run(_get_settings_by_document(document.path)) == "onType":
         diagnostics: list[Diagnostic] = await _lint_document_impl(document)
         LSP_SERVER.publish_diagnostics(document.uri, diagnostics)
 
 
-async def _lint_document_impl(document: workspace.Document) -> list[Diagnostic]:
+async def _lint_document_impl(document: workspace.TextDocument) -> list[Diagnostic]:
     result = await _run_check_on_document(document)
     if result is None:
         return []
@@ -329,7 +364,7 @@ CODE_REGEX = re.compile(r"[A-Z]+[0-9]+")
 @LSP_SERVER.feature(TEXT_DOCUMENT_HOVER)
 async def hover(params: HoverParams) -> Hover | None:
     """LSP handler for textDocument/hover request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
     match = NOQA_REGEX.search(document.lines[params.position.line])
     if not match:
         return None
@@ -346,7 +381,7 @@ async def hover(params: HoverParams) -> Hover | None:
         if start <= params.position.character < end:
             code = match.group()
             result = await _run_subcommand_on_document(
-                document, args=["--explain", code]
+                document, VERSION_REQUIREMENT_LINTER, args=["--explain", code]
             )
             if result.stdout:
                 return Hover(
@@ -420,9 +455,9 @@ class LegacyFix(TypedDict):
 )
 async def code_action(params: CodeActionParams) -> list[CodeAction] | None:
     """LSP handler for textDocument/codeAction request."""
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
 
-    settings = _get_settings_by_document(document)
+    settings = _get_settings_by_document(document.path)
 
     if utils.is_stdlib_file(document.path):
         # Don't format standard library files.
@@ -635,9 +670,9 @@ async def code_action(params: CodeActionParams) -> list[CodeAction] | None:
 @LSP_SERVER.feature(CODE_ACTION_RESOLVE)
 async def resolve_code_action(params: CodeAction) -> CodeAction:
     """LSP handler for codeAction/resolve request."""
-    document = LSP_SERVER.workspace.get_document(cast(str, params.data))
+    document = LSP_SERVER.workspace.get_text_document(cast(str, params.data))
 
-    settings = _get_settings_by_document(document)
+    settings = _get_settings_by_document(document.path)
 
     if settings["organizeImports"] and params.kind in (
         CodeActionKind.SourceOrganizeImports,
@@ -661,7 +696,7 @@ async def resolve_code_action(params: CodeAction) -> CodeAction:
 @LSP_SERVER.command("ruff.applyAutofix")
 async def apply_autofix(arguments: tuple[TextDocument]):
     uri = arguments[0]["uri"]
-    text_document = LSP_SERVER.workspace.get_document(uri)
+    text_document = LSP_SERVER.workspace.get_text_document(uri)
     results = await _fix_document_impl(text_document)
     LSP_SERVER.apply_edit(
         _create_workspace_edits(text_document, results),
@@ -672,7 +707,7 @@ async def apply_autofix(arguments: tuple[TextDocument]):
 @LSP_SERVER.command("ruff.applyOrganizeImports")
 async def apply_organize_imports(arguments: tuple[TextDocument]):
     uri = arguments[0]["uri"]
-    text_document = LSP_SERVER.workspace.get_document(uri)
+    text_document = LSP_SERVER.workspace.get_text_document(uri)
     results = await _fix_document_impl(text_document, only="I001")
     LSP_SERVER.apply_edit(
         _create_workspace_edits(text_document, results),
@@ -680,28 +715,36 @@ async def apply_organize_imports(arguments: tuple[TextDocument]):
     )
 
 
-if RUFF_EXPERIMENTAL_FORMATTER:
+@LSP_SERVER.command("ruff.applyFormat")
+async def apply_format(arguments: tuple[TextDocument]):
+    uri = arguments[0]["uri"]
+    text_document = LSP_SERVER.workspace.get_text_document(uri)
+    results = await _format_document_impl(text_document)
+    LSP_SERVER.apply_edit(
+        _create_workspace_edits(text_document, results),
+        "Ruff: Format document",
+    )
 
-    @LSP_SERVER.feature(TEXT_DOCUMENT_FORMATTING)
-    async def format_document(
-        ls: server.LanguageServer,
-        params: DocumentFormattingParams,
-    ) -> list[TextEdit] | None:
-        return await _format_document_impl(ls, params)
+
+@LSP_SERVER.feature(TEXT_DOCUMENT_FORMATTING)
+async def format_document(
+    ls: server.LanguageServer,
+    params: DocumentFormattingParams,
+) -> list[TextEdit] | None:
+    uri = params.text_document.uri
+    document = ls.workspace.get_text_document(uri)
+    return await _format_document_impl(document)
 
 
 async def _format_document_impl(
-    language_server: server.LanguageServer,
-    params: DocumentFormattingParams,
+    document: workspace.TextDocument,
 ) -> list[TextEdit]:
-    uri = params.text_document.uri
-    document = language_server.workspace.get_document(uri)
     result = await _run_format_on_document(document)
     return _result_to_edits(document, result)
 
 
 async def _fix_document_impl(
-    document: workspace.Document,
+    document: workspace.TextDocument,
     *,
     only: str | None = None,
 ) -> list[TextEdit]:
@@ -710,7 +753,7 @@ async def _fix_document_impl(
 
 
 def _result_to_edits(
-    document: workspace.Document,
+    document: workspace.TextDocument,
     result: RunResult | None,
 ) -> list[TextEdit]:
     if result is None:
@@ -743,7 +786,7 @@ def _result_to_edits(
 
 
 def _create_workspace_edits(
-    document: workspace.Document,
+    document: workspace.TextDocument,
     edits: Sequence[TextEdit | AnnotatedTextEdit],
 ) -> WorkspaceEdit:
     return WorkspaceEdit(
@@ -759,7 +802,7 @@ def _create_workspace_edits(
     )
 
 
-def _create_workspace_edit(document: workspace.Document, fix: Fix) -> WorkspaceEdit:
+def _create_workspace_edit(document: workspace.TextDocument, fix: Fix) -> WorkspaceEdit:
     return WorkspaceEdit(
         document_changes=[
             TextDocumentEdit(
@@ -801,7 +844,7 @@ def _get_line_endings(text: str) -> str | None:
     return None  # No line ending found
 
 
-def _match_line_endings(document: workspace.Document, text: str) -> str:
+def _match_line_endings(document: workspace.TextDocument, text: str) -> str:
     """Ensures that the edited text line endings matches the document line endings."""
     expected = _get_line_endings(document.source)
     actual = _get_line_endings(text)
@@ -848,11 +891,6 @@ def initialize(params: InitializeParams) -> None:
     CLIENT_CAPABILITIES[CODE_ACTION_RESOLVE] = _supports_code_action_resolve(
         params.capabilities
     )
-
-    # Internal hidden beta feature. We want to have this in the code base, but we
-    # don't want to expose it to users yet, hence the environment variable. You can
-    # e.g. use this with VS Code by doing `RUFF_EXPERIMENTAL_FORMATTER=1 code .`
-    # CLIENT_CAPABILITIES[TEXT_DOCUMENT_FORMATTING] = RUFF_EXPERIMENTAL_FORMATTER
 
     # Extract `settings` from the initialization options.
     workspace_settings: list[WorkspaceSettings] | WorkspaceSettings | None = (
@@ -914,17 +952,27 @@ def _supports_code_action_resolve(capabilities: ClientCapabilities) -> bool:
 
 
 def _get_global_defaults() -> UserSettings:
-    return {
-        "logLevel": GLOBAL_SETTINGS.get("logLevel", "error"),
-        "args": GLOBAL_SETTINGS.get("args", []),
-        "path": GLOBAL_SETTINGS.get("path", []),
-        "interpreter": GLOBAL_SETTINGS.get("interpreter", [sys.executable]),
-        "importStrategy": GLOBAL_SETTINGS.get("importStrategy", "fromEnvironment"),
-        "run": GLOBAL_SETTINGS.get("run", "onType"),
+    settings: UserSettings = {
         "codeAction": GLOBAL_SETTINGS.get("codeAction", {}),
-        "organizeImports": GLOBAL_SETTINGS.get("organizeImports", True),
         "fixAll": GLOBAL_SETTINGS.get("fixAll", True),
+        "importStrategy": GLOBAL_SETTINGS.get("importStrategy", "fromEnvironment"),
+        "interpreter": GLOBAL_SETTINGS.get("interpreter", [sys.executable]),
+        "lint": GLOBAL_SETTINGS.get("lint", {}),
+        "format": GLOBAL_SETTINGS.get("format", {}),
+        "logLevel": GLOBAL_SETTINGS.get("logLevel", "error"),
+        "organizeImports": GLOBAL_SETTINGS.get("organizeImports", True),
+        "path": GLOBAL_SETTINGS.get("path", []),
     }
+
+    # Deprecated: use `lint.args` instead.
+    if "args" in GLOBAL_SETTINGS:
+        settings["args"] = GLOBAL_SETTINGS["args"]
+
+    # Deprecated: use `lint.run` instead.
+    if "run" in GLOBAL_SETTINGS:
+        settings["run"] = GLOBAL_SETTINGS["run"]
+
+    return settings
 
 
 def _update_workspace_settings(settings: list[WorkspaceSettings]) -> None:
@@ -959,8 +1007,8 @@ def _update_workspace_settings(settings: list[WorkspaceSettings]) -> None:
             }
 
 
-def _get_document_key(document: workspace.Document) -> str | None:
-    document_workspace = Path(document.path)
+def _get_document_key(document_path: str) -> str | None:
+    document_workspace = Path(document_path)
     workspaces = {s["workspacePath"] for s in WORKSPACE_SETTINGS.values()}
 
     while document_workspace != document_workspace.parent:
@@ -970,14 +1018,11 @@ def _get_document_key(document: workspace.Document) -> str | None:
     return None
 
 
-def _get_settings_by_document(document: workspace.Document | None) -> WorkspaceSettings:
-    if document is None or document.path is None:
-        return list(WORKSPACE_SETTINGS.values())[0]
-
-    key = _get_document_key(document)
+def _get_settings_by_document(document_path: str) -> WorkspaceSettings:
+    key = _get_document_key(document_path)
     if key is None:
         # This is either a non-workspace file or there is no workspace.
-        workspace_path = os.fspath(Path(document.path).parent)
+        workspace_path = os.fspath(Path(document_path).parent)
         return {
             **_get_global_defaults(),  # type: ignore[misc]
             "cwd": None,
@@ -993,7 +1038,37 @@ def _get_settings_by_document(document: workspace.Document | None) -> WorkspaceS
 ###
 
 
-def _executable_path(settings: WorkspaceSettings) -> str:
+class Executable(NamedTuple):
+    path: str
+    """The path to the executable."""
+
+    version: Version
+    """The version of the executable."""
+
+
+def _find_ruff_binary(
+    settings: WorkspaceSettings, version_requirement: SpecifierSet | None
+) -> Executable:
+    """Returns the executable along with its version.
+
+    If the executable doesn't meet the version requirement, raises a RuntimeError and
+    displays an error message.
+    """
+    path = _find_ruff_binary_path(settings)
+
+    version = _executable_version(path)
+    if version_requirement and not version_requirement.contains(
+        version, prereleases=True
+    ):
+        message = f"Ruff {version_requirement} required, but found {version} at {path}"
+        show_error(message)
+        raise RuntimeError(message)
+    log_to_output(f"Found ruff {version} at {path}")
+
+    return Executable(path, version)
+
+
+def _find_ruff_binary_path(settings: WorkspaceSettings) -> str:
     """Returns the path to the executable."""
     bundle = get_bundle()
 
@@ -1048,17 +1123,22 @@ def _executable_path(settings: WorkspaceSettings) -> str:
     return path
 
 
-def _executable_version(executable: str) -> str:
+def _executable_version(executable: str) -> Version:
     """Returns the version of the executable."""
-    if executable not in EXECUTABLE_VERSIONS:
+    # If the user change the file (e.g. `pip install -U ruff`), invalidate the cache
+    modified = Path(executable).stat().st_mtime
+    if (
+        executable not in EXECUTABLE_VERSIONS
+        or EXECUTABLE_VERSIONS[executable].modified != modified
+    ):
         version = utils.version(executable)
         log_to_output(f"Inferred version {version} for: {executable}")
-        EXECUTABLE_VERSIONS[executable] = version
-    return EXECUTABLE_VERSIONS[executable]
+        EXECUTABLE_VERSIONS[executable] = VersionModified(version, modified)
+    return EXECUTABLE_VERSIONS[executable].version
 
 
 async def _run_check_on_document(
-    document: workspace.Document,
+    document: workspace.TextDocument,
     *,
     extra_args: Sequence[str] = [],
     only: str | None = None,
@@ -1072,21 +1152,32 @@ async def _run_check_on_document(
         log_warning(f"Skipping standard library file: {document.path}")
         return None
 
-    settings = _get_settings_by_document(document)
+    settings = _get_settings_by_document(document.path)
 
-    executable = _executable_path(settings)
+    executable = _find_ruff_binary(settings, VERSION_REQUIREMENT_LINTER)
     argv: list[str] = CHECK_ARGS + list(extra_args)
 
-    for arg in settings["args"]:
-        if arg in UNSUPPORTED_ARGS:
+    for arg in lint_args(settings):
+        if arg in UNSUPPORTED_CHECK_ARGS:
             log_to_output(f"Ignoring unsupported argument: {arg}")
         else:
             argv.append(arg)
 
+    # If the Ruff version is not sufficiently recent, use the deprecated `--format`
+    # argument instead of `--output-format`.
+    if not VERSION_REQUIREMENT_OUTPUT_FORMAT.contains(
+        executable.version, prereleases=True
+    ):
+        index = argv.index("--output-format")
+        argv.pop(index)
+        argv.insert(index, "--format")
+
     # If we're trying to run a single rule, add it to the command line, and disable
     # all other rules (if the Ruff version is sufficiently recent).
     if only:
-        if _executable_version(executable) >= "0.0.198":
+        if VERSION_REQUIREMENT_ALL_SELECTOR.contains(
+            executable.version, prereleases=True
+        ):
             argv += ["--extend-ignore", "ALL"]
         argv += ["--extend-select", only]
 
@@ -1094,14 +1185,14 @@ async def _run_check_on_document(
     argv += ["--stdin-filename", document.path]
 
     return await run_path(
-        executable,
+        executable.path,
         argv,
         cwd=settings["cwd"],
         source=document.source,
     )
 
 
-async def _run_format_on_document(document: workspace.Document) -> RunResult | None:
+async def _run_format_on_document(document: workspace.TextDocument) -> RunResult | None:
     """Runs the Ruff `format` subcommand on the given document."""
     if str(document.uri).startswith("vscode-notebook-cell"):
         # Skip notebook cells
@@ -1111,8 +1202,8 @@ async def _run_format_on_document(document: workspace.Document) -> RunResult | N
         log_warning(f"Skipping standard library file: {document.path}")
         return None
 
-    settings = _get_settings_by_document(document)
-    executable = _executable_path(settings)
+    settings = _get_settings_by_document(document.path)
+    executable = _find_ruff_binary(settings, VERSION_REQUIREMENT_FORMATTER)
     argv: list[str] = [
         "format",
         "--force-exclude",
@@ -1121,8 +1212,14 @@ async def _run_format_on_document(document: workspace.Document) -> RunResult | N
         document.path,
     ]
 
+    for arg in settings.get("format", {}).get("args", []):
+        if arg in UNSUPPORTED_FORMAT_ARGS:
+            log_to_output(f"Ignoring unsupported argument: {arg}")
+        else:
+            argv.append(arg)
+
     return await run_path(
-        executable,
+        executable.path,
         argv,
         cwd=settings["cwd"],
         source=document.source,
@@ -1130,15 +1227,18 @@ async def _run_format_on_document(document: workspace.Document) -> RunResult | N
 
 
 async def _run_subcommand_on_document(
-    document: workspace.Document, *, args: Sequence[str]
+    document: workspace.TextDocument,
+    version_requirement: SpecifierSet,
+    *,
+    args: Sequence[str],
 ) -> RunResult:
     """Runs the tool subcommand on the given document."""
-    settings = _get_settings_by_document(document)
+    settings = _get_settings_by_document(document.path)
 
-    executable = _executable_path(settings)
+    executable = _find_ruff_binary(settings, version_requirement)
     argv: list[str] = list(args)
     return await run_path(
-        executable,
+        executable.path,
         argv,
         cwd=settings["cwd"],
         source=document.source,
@@ -1154,10 +1254,10 @@ def log_to_output(message: str) -> None:
     LSP_SERVER.show_message_log(message, MessageType.Log)
 
 
-def log_error(message: str) -> None:
+def show_error(message: str) -> None:
+    """Show a pop-up with an error. Only use for critical errors."""
     LSP_SERVER.show_message_log(message, MessageType.Error)
-    if os.getenv("LS_SHOW_NOTIFICATION", "off") in ["onError", "onWarning", "always"]:
-        LSP_SERVER.show_message(message, MessageType.Error)
+    LSP_SERVER.show_message(message, MessageType.Error)
 
 
 def log_warning(message: str) -> None:

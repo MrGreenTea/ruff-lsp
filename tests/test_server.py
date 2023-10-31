@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 import tempfile
-import unittest
+from dataclasses import dataclass
 from threading import Event
+
+from packaging.version import Version
+from typing_extensions import Self
 
 from tests.client import defaults, session, utils
 
@@ -16,11 +19,35 @@ CONTENTS = """import sys
 print(x)
 """
 
+VERSION_REQUIREMENT_ASTRAL_DOCS = Version("0.0.291")
+VERSION_REQUIREMENT_APPLICABILITY_RENAME = Version("0.1.0")
 
-class TestServer(unittest.TestCase):
+
+@dataclass(frozen=True)
+class Applicability:
+    safe: str
+    unsafe: str
+    display: str
+
+    @classmethod
+    def from_ruff_version(cls, ruff_version: Version) -> Self:
+        if ruff_version >= VERSION_REQUIREMENT_APPLICABILITY_RENAME:
+            return cls(safe="safe", unsafe="unsafe", display="display")
+        else:
+            return cls(safe="Automatic", unsafe="Suggested", display="Manual")
+
+
+class TestServer:
     maxDiff = None
 
-    def test_linting_example(self) -> None:
+    def test_linting_example(self, ruff_version: Version) -> None:
+        expected_docs_url = (
+            "https://docs.astral.sh/ruff/"
+            if ruff_version >= VERSION_REQUIREMENT_ASTRAL_DOCS
+            else "https://beta.ruff.rs/docs/"
+        )
+        applicability = Applicability.from_ruff_version(ruff_version)
+
         with tempfile.NamedTemporaryFile(suffix=".py") as fp:
             fp.write(CONTENTS.encode())
             fp.flush()
@@ -60,11 +87,11 @@ class TestServer(unittest.TestCase):
                         {
                             "code": "F401",
                             "codeDescription": {
-                                "href": "https://beta.ruff.rs/docs/rules/unused-import"
+                                "href": expected_docs_url + "rules/unused-import"
                             },
                             "data": {
                                 "fix": {
-                                    "applicability": "Automatic",
+                                    "applicability": applicability.safe,
                                     "edits": [
                                         {
                                             "content": "",
@@ -88,7 +115,7 @@ class TestServer(unittest.TestCase):
                         {
                             "code": "F821",
                             "codeDescription": {
-                                "href": "https://beta.ruff.rs/docs/rules/undefined-name"
+                                "href": expected_docs_url + "rules/undefined-name"
                             },
                             "data": {"fix": None, "noqa_row": 3},
                             "message": "Undefined name `x`",
@@ -102,9 +129,16 @@ class TestServer(unittest.TestCase):
                     ],
                     "uri": uri,
                 }
-            self.assertEqual(expected, actual)
+            assert expected == actual
 
-    def test_no_initialization_options(self) -> None:
+    def test_no_initialization_options(self, ruff_version: Version) -> None:
+        expected_docs_url = (
+            "https://docs.astral.sh/ruff/"
+            if ruff_version >= VERSION_REQUIREMENT_ASTRAL_DOCS
+            else "https://beta.ruff.rs/docs/"
+        )
+        applicability = Applicability.from_ruff_version(ruff_version)
+
         with tempfile.NamedTemporaryFile(suffix=".py") as fp:
             fp.write(CONTENTS.encode())
             fp.flush()
@@ -149,11 +183,11 @@ class TestServer(unittest.TestCase):
                         {
                             "code": "F401",
                             "codeDescription": {
-                                "href": "https://beta.ruff.rs/docs/rules/unused-import"
+                                "href": expected_docs_url + "rules/unused-import"
                             },
                             "data": {
                                 "fix": {
-                                    "applicability": "Automatic",
+                                    "applicability": applicability.safe,
                                     "edits": [
                                         {
                                             "content": "",
@@ -177,7 +211,7 @@ class TestServer(unittest.TestCase):
                         {
                             "code": "F821",
                             "codeDescription": {
-                                "href": "https://beta.ruff.rs/docs/rules/undefined-name"
+                                "href": expected_docs_url + "rules/undefined-name"
                             },
                             "data": {"fix": None, "noqa_row": 3},
                             "message": "Undefined name `x`",
@@ -191,4 +225,4 @@ class TestServer(unittest.TestCase):
                     ],
                     "uri": uri,
                 }
-            self.assertEqual(expected, actual)
+            assert expected == actual
